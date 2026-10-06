@@ -1,0 +1,25 @@
+[
+  {
+    "name": "password-server",
+    "destination": "192.0.2.10",
+    "port": 22,
+    "username": "admin",
+    "authentication": {
+      "type": "password",
+      "password": "REPLACE_WITH_PASSWORD"
+    },
+    "description": "Example using password authentication"
+  },
+  {
+    "name": "key-server",
+    "destination": "build.example.com",
+    "port": 22,
+    "username": "deploy",
+    "authentication": {
+      "type": "private_key",
+      "private_key_path": "C:\\Users\\YOUR_NAME\\.ssh\\id_ed25519",
+      "passphrase": ""
+    },
+    "description": "Example using a private key"
+  }
+]
