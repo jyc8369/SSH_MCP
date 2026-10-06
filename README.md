@@ -1,21 +1,21 @@
 # SSH MCP
 
-Rust MCP stdio server for user-registered SSH hosts. It authenticates with passwords or private keys, verifies host keys using the local `~/.ssh/known_hosts`, and keeps interactive shells alive between tool calls.
+Rust MCP stdio server for user-configured SSH hosts. It supports password and private-key authentication, checks host keys against the local `~/.ssh/known_hosts`, and keeps interactive shells alive between MCP calls.
 
-## Configure servers
+## Host configuration
 
-Copy `servers.example.json` to `servers.json` in this directory and replace the example credentials. Or set `SSH_SERVERS_FILE` to a different file. `servers.json` is excluded by `.gitignore`; restrict its Windows file permissions because password credentials are stored as plaintext.
+Copy `host.example.json` to `host.json` in this MCP directory and replace the example values. Configure the MCP client's `cwd` as this same directory so the server loads `host.json`. You can override the path with `SSH_HOST_FILE`; the older `SSH_SERVERS_FILE` environment variable remains supported. `host.json` is excluded from Git because it contains credentials. Restrict its Windows file permissions.
 
-Each entry has a unique `name`, `destination`, optional `port` (default `22`), `username`, `authentication`, and optional `description`. Password and private key authentication are supported. The SSH host key must already be verified and present in the current user's `~/.ssh/known_hosts`; unknown or changed keys are rejected.
+The JSON can be a single host object, an array of hosts, or an object with a `hosts` array. Each host has a unique `name`, `destination`, optional `port` (default `22`), `username`, `authentication`, and optional `description`. Authentication supports `password` or `private_key` with a key path and optional passphrase. Unknown or changed server keys are rejected; verify and add the key to the current user's `~/.ssh/known_hosts` first.
 
-## Tools
+## MCP tools
 
-- `list_servers`: list registered hosts and authentication types without exposing credentials.
-- `open_session`: authenticate to a registered host and return a reusable `session_id`.
-- `send_command`: run a command in that persistent shell. Directory and environment changes persist. Use `isolated: true` for a one-shot command that closes stdin and returns its exit code without persisting shell changes.
-- `close_session`: close a session when finished.
+- `list_servers`: list host names and authentication types without revealing credentials.
+- `open_session`: authenticate and return a reusable `session_id`.
+- `send_command`: execute a command in that persistent shell. `cd` and exported variables persist. Set `isolated: true` to run a one-shot command and return its exit code without persisting shell changes.
+- `close_session`: close the SSH session.
 
-Sessions exist only for the lifetime of this MCP process and expire after the configured idle timeout. A command timeout closes its session to prevent late output from mixing with later commands. Remote commands run with the registered account's permissions; use least-privilege accounts and register only approved hosts.
+Sessions last for the MCP process lifetime and expire after the idle timeout. Remote commands run with the registered account's permissions; use least-privilege accounts and register only approved hosts.
 
 ## Build
 
@@ -26,4 +26,4 @@ cargo build --release --locked
 .\target\release\ssh-mcp.exe
 ```
 
-For MCP stdio configuration, set `command` to this executable's absolute path and `cwd` to this directory. Optional environment settings are `SSH_SERVERS_FILE`, `SSH_CONNECT_TIMEOUT_SECS` (1–60), `SSH_IDLE_TIMEOUT_SECS` (30–86400; default 1800), and `SSH_USER`.
+Set the MCP client's `command` to the executable's absolute path and `cwd` to this directory. Optional environment settings: `SSH_HOST_FILE`, `SSH_CONNECT_TIMEOUT_SECS` (1–60), `SSH_IDLE_TIMEOUT_SECS` (30–86400; default 1800), and `SSH_USER`.

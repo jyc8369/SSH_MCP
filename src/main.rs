@@ -50,6 +50,23 @@ struct RegisteredServer {
     description: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HostFile {
+    Servers(Vec<RegisteredServer>),
+    Wrapped { hosts: Vec<RegisteredServer> },
+    Single(RegisteredServer),
+}
+
+impl HostFile {
+    fn into_servers(self) -> Vec<RegisteredServer> {
+        match self {
+            Self::Servers(servers) | Self::Wrapped { hosts: servers } => servers,
+            Self::Single(server) => vec![server],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Authentication {
@@ -137,15 +154,20 @@ impl Handler for HostKeyChecker {
 #[tool_router]
 impl SshServer {
     fn new() -> Result<Self> {
-        let registry_path = env::var_os("SSH_SERVERS_FILE")
+        let registry_path = env::var_os("SSH_HOST_FILE")
+            .or_else(|| env::var_os("SSH_SERVERS_FILE"))
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("servers.json"));
+            .unwrap_or_else(|| {
+                env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join("host.json")
+            });
         let servers = if registry_path.exists() {
             let raw = std::fs::read_to_string(&registry_path)
                 .with_context(|| format!("failed to read {}", registry_path.display()))?;
-            let entries: Vec<RegisteredServer> = serde_json::from_str(&raw)
+            let entries: HostFile = serde_json::from_str(&raw)
                 .with_context(|| format!("invalid JSON in {}", registry_path.display()))?;
-            validate_registry(entries)?
+            validate_registry(entries.into_servers())?
         } else {
             HashMap::new()
         };
@@ -199,7 +221,10 @@ impl SshServer {
             ));
         }
         if lines.is_empty() {
-            lines.push("No SSH servers are registered. Add entries to SSH_SERVERS_FILE.".into());
+            lines.push(
+                "No SSH servers are registered. Add hosts to host.json beside the MCP executable."
+                    .into(),
+            );
         }
         Ok(CallToolResult::success(vec![ContentBlock::text(
             lines.join("\n"),
