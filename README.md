@@ -8,6 +8,8 @@ Copy `host.example.json` to `host.json` in this MCP directory and replace the ex
 
 The JSON can be a single host object, an array of hosts, or an object with a `hosts` array. Each host has a unique `name`, `destination`, optional `port` (default `22`), `username`, `authentication`, and optional `description`. Authentication supports `password` or `private_key` with a key path and optional passphrase. Unknown or changed server keys are rejected; verify and add the key to the current user's `~/.ssh/known_hosts` first.
 
+The MCP reloads `host.json` whenever `list_servers` or `open_session` is called. Changes therefore apply to the next tool call without restarting the MCP process. Existing SSH sessions remain connected with their original settings; close and reopen a session to apply host changes. If the file is temporarily invalid JSON, the tool returns a reload error and retains the last valid configuration.
+
 ## MCP tools
 
 - `list_servers`: list host names and authentication types without revealing credentials.

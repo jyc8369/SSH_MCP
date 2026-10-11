@@ -16,7 +16,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, RwLock, mpsc, oneshot},
     time::{sleep, timeout},
 };
 use uuid::Uuid;
@@ -30,7 +30,8 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1800;
 #[derive(Clone)]
 struct SshServer {
     tool_router: ToolRouter<Self>,
-    servers: Arc<HashMap<String, RegisteredServer>>,
+    servers: Arc<RwLock<HashMap<String, RegisteredServer>>>,
+    registry_path: PathBuf,
     sessions: SessionStore,
     default_user: Option<String>,
     connect_timeout_secs: u64,
@@ -162,19 +163,12 @@ impl SshServer {
                     .unwrap_or_else(|_| PathBuf::from("."))
                     .join("host.json")
             });
-        let servers = if registry_path.exists() {
-            let raw = std::fs::read_to_string(&registry_path)
-                .with_context(|| format!("failed to read {}", registry_path.display()))?;
-            let entries: HostFile = serde_json::from_str(&raw)
-                .with_context(|| format!("invalid JSON in {}", registry_path.display()))?;
-            validate_registry(entries.into_servers())?
-        } else {
-            HashMap::new()
-        };
+        let servers = load_registry(&registry_path)?;
 
         Ok(Self {
             tool_router: Self::tool_router(),
-            servers: Arc::new(servers),
+            servers: Arc::new(RwLock::new(servers)),
+            registry_path,
             sessions: SessionStore(Arc::new(Mutex::new(HashMap::new()))),
             default_user: env::var("SSH_USER").ok().filter(|v| !v.trim().is_empty()),
             connect_timeout_secs: env::var("SSH_CONNECT_TIMEOUT_SECS")
@@ -190,12 +184,24 @@ impl SshServer {
         })
     }
 
+    async fn reload_registry(&self) -> Result<()> {
+        let servers = load_registry(&self.registry_path)?;
+        *self.servers.write().await = servers;
+        Ok(())
+    }
+
     #[tool(
         name = "list_servers",
-        description = "List SSH servers registered in the user's local JSON file."
+        description = "Reload host.json and list the currently registered SSH servers."
     )]
     async fn list_servers(&self) -> Result<CallToolResult, McpError> {
-        let mut servers: Vec<_> = self.servers.values().collect();
+        self.reload_registry().await.map_err(|error| {
+            McpError::internal_error(
+                format!("failed to reload SSH host configuration: {error}"),
+                None,
+            )
+        })?;
+        let mut servers: Vec<_> = self.servers.read().await.values().cloned().collect();
         servers.sort_by(|a, b| a.name.cmp(&b.name));
         let sessions: Vec<_> = self.sessions.0.lock().await.values().cloned().collect();
         let mut lines = Vec::new();
@@ -233,19 +239,27 @@ impl SshServer {
 
     #[tool(
         name = "open_session",
-        description = "Authenticate to a registered SSH server with its JSON credentials and keep an interactive shell alive. Returns a session_id."
+        description = "Reload host.json, then authenticate to the selected server and keep an interactive shell alive. Returns a session_id."
     )]
     async fn open_session(
         &self,
         Parameters(input): Parameters<ServerNameRequest>,
     ) -> Result<CallToolResult, McpError> {
+        self.reload_registry().await.map_err(|error| {
+            McpError::internal_error(
+                format!("failed to reload SSH host configuration: {error}"),
+                None,
+            )
+        })?;
         let server = self
             .servers
+            .read()
+            .await
             .get(&input.server)
+            .cloned()
             .ok_or_else(|| {
                 McpError::invalid_params("server is not registered; call list_servers", None)
-            })?
-            .clone();
+            })?;
         let username = server
             .username
             .clone()
@@ -642,6 +656,17 @@ fn validate_host(host: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+fn load_registry(path: &std::path::Path) -> Result<HashMap<String, RegisteredServer>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let entries: HostFile = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
+    validate_registry(entries.into_servers())
+}
+
 fn validate_registry(entries: Vec<RegisteredServer>) -> Result<HashMap<String, RegisteredServer>> {
     let mut servers = HashMap::new();
     for entry in entries {
@@ -759,7 +784,7 @@ impl ServerHandler for SshServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
-            .with_instructions("AI usage: call list_servers to identify a registered host, then open_session and keep reusing its session_id in send_command. For one-shot commands inside a Proxmox container, use `pct exec <CTID> -- <command>` with send_command isolated=true. Do not use interactive `pct enter` with send_command; it does not finish like a normal command. isolated=true closes stdin and runs without a controlling terminal, then returns output and exit code; the command inherits the current directory and environment, but changes it do not persist. Use the default isolated=false for normal shell commands when cd or exported variables must persist. Close sessions with close_session when done.")
+            .with_instructions("The host registry is reloaded from host.json on every list_servers and open_session call, so edits apply without restarting this MCP process. A running SSH session keeps its established connection and credentials; close it and open a new session to apply host changes to that session. If host.json is temporarily invalid, reload returns an error and keeps the last valid registry. Call list_servers to identify a host, then open_session and reuse its session_id in send_command. For one-shot commands inside a Proxmox container, use `pct exec <CTID> -- <command>` with send_command isolated=true. Do not use interactive `pct enter` with send_command. isolated=true closes stdin and returns output and exit code without persisting shell changes. Use isolated=false when cd or exported variables must persist. Close sessions with close_session when done.")
     }
 }
 
