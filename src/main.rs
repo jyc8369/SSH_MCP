@@ -1,6 +1,7 @@
-use std::{collections::HashMap, env, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, env, future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
+use chrono::{SecondsFormat, Utc};
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -13,7 +14,7 @@ use russh::{
     keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate},
 };
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     sync::{Mutex, RwLock, mpsc, oneshot},
@@ -33,9 +34,19 @@ struct SshServer {
     servers: Arc<RwLock<HashMap<String, RegisteredServer>>>,
     registry_path: PathBuf,
     sessions: SessionStore,
+    last_error: Arc<Mutex<Option<ErrorRecord>>>,
     default_user: Option<String>,
     connect_timeout_secs: u64,
     idle_timeout_secs: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ErrorRecord {
+    timestamp_utc: String,
+    operation: String,
+    server: Option<String>,
+    session_id: Option<String>,
+    detail: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -170,6 +181,7 @@ impl SshServer {
             servers: Arc::new(RwLock::new(servers)),
             registry_path,
             sessions: SessionStore(Arc::new(Mutex::new(HashMap::new()))),
+            last_error: Arc::new(Mutex::new(None)),
             default_user: env::var("SSH_USER").ok().filter(|v| !v.trim().is_empty()),
             connect_timeout_secs: env::var("SSH_CONNECT_TIMEOUT_SECS")
                 .ok()
@@ -190,51 +202,104 @@ impl SshServer {
         Ok(())
     }
 
+    async fn record_error(
+        &self,
+        operation: &str,
+        server: Option<&str>,
+        session_id: Option<&str>,
+        detail: String,
+    ) {
+        *self.last_error.lock().await = Some(ErrorRecord {
+            timestamp_utc: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            operation: operation.to_owned(),
+            server: server.map(str::to_owned),
+            session_id: session_id.map(str::to_owned),
+            detail: truncate(&detail),
+        });
+    }
+
+    async fn capture_failure<T, F>(
+        &self,
+        operation: &str,
+        server: Option<&str>,
+        session_id: Option<&str>,
+        future: F,
+    ) -> Result<T, McpError>
+    where
+        F: Future<Output = Result<T, McpError>>,
+    {
+        let result = future.await;
+        if let Err(error) = &result {
+            self.record_error(operation, server, session_id, error.to_string())
+                .await;
+        }
+        result
+    }
+
     #[tool(
         name = "list_servers",
         description = "Reload host.json and list the currently registered SSH servers."
     )]
     async fn list_servers(&self) -> Result<CallToolResult, McpError> {
-        self.reload_registry().await.map_err(|error| {
-            McpError::internal_error(
-                format!("failed to reload SSH host configuration: {error}"),
-                None,
-            )
-        })?;
-        let mut servers: Vec<_> = self.servers.read().await.values().cloned().collect();
-        servers.sort_by(|a, b| a.name.cmp(&b.name));
-        let sessions: Vec<_> = self.sessions.0.lock().await.values().cloned().collect();
-        let mut lines = Vec::new();
-        for server in servers {
-            let mut active = 0;
-            for session in &sessions {
-                if session.server_name == server.name {
-                    active += 1;
+        self.capture_failure("list_servers", None, None, async {
+            self.reload_registry().await.map_err(|error| {
+                McpError::internal_error(
+                    format!("failed to reload SSH host configuration: {error}"),
+                    None,
+                )
+            })?;
+            let mut servers: Vec<_> = self.servers.read().await.values().cloned().collect();
+            servers.sort_by(|a, b| a.name.cmp(&b.name));
+            let sessions: Vec<_> = self.sessions.0.lock().await.values().cloned().collect();
+            let mut lines = Vec::new();
+            for server in servers {
+                let mut active = 0;
+                for session in &sessions {
+                    if session.server_name == server.name {
+                        active += 1;
+                    }
                 }
+                let label = server
+                    .description
+                    .as_deref()
+                    .filter(|s| !s.eq_ignore_ascii_case("none"))
+                    .unwrap_or(&server.destination);
+                lines.push(format!(
+                    "{} — {}:{}; auth={}; active sessions: {}",
+                    server.name,
+                    label,
+                    server.port,
+                    server.authentication.kind(),
+                    active
+                ));
             }
-            let label = server
-                .description
-                .as_deref()
-                .filter(|s| !s.eq_ignore_ascii_case("none"))
-                .unwrap_or(&server.destination);
-            lines.push(format!(
-                "{} — {}:{}; auth={}; active sessions: {}",
-                server.name,
-                label,
-                server.port,
-                server.authentication.kind(),
-                active
-            ));
+            if lines.is_empty() {
+                lines.push(
+                    "No SSH servers are registered. Add hosts to host.json beside the MCP executable."
+                        .into(),
+                );
+            }
+            Ok(CallToolResult::success(vec![ContentBlock::text(
+                lines.join("\n"),
+            )]))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "debug",
+        description = "Return the most recent SSH MCP failure with its UTC timestamp, operation, server/session context, and detailed error. Call this after any failed SSH tool response. This record is kept in memory until another failure or MCP process exit."
+    )]
+    async fn debug(&self) -> CallToolResult {
+        match self.last_error.lock().await.clone() {
+            Some(record) => CallToolResult::success(vec![ContentBlock::text(
+                serde_json::to_string_pretty(&record)
+                    .unwrap_or_else(|_| "Could not serialize the last SSH error.".to_owned()),
+            )]),
+            None => CallToolResult::success(vec![ContentBlock::text(
+                "No SSH MCP failures have been recorded since this process started.",
+            )]),
         }
-        if lines.is_empty() {
-            lines.push(
-                "No SSH servers are registered. Add hosts to host.json beside the MCP executable."
-                    .into(),
-            );
-        }
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            lines.join("\n"),
-        )]))
     }
 
     #[tool(
@@ -245,95 +310,104 @@ impl SshServer {
         &self,
         Parameters(input): Parameters<ServerNameRequest>,
     ) -> Result<CallToolResult, McpError> {
-        self.reload_registry().await.map_err(|error| {
-            McpError::internal_error(
-                format!("failed to reload SSH host configuration: {error}"),
-                None,
-            )
-        })?;
-        let server = self
-            .servers
-            .read()
-            .await
-            .get(&input.server)
-            .cloned()
-            .ok_or_else(|| {
-                McpError::invalid_params("server is not registered; call list_servers", None)
-            })?;
-        let username = server
-            .username
-            .clone()
-            .or_else(|| {
-                server
-                    .destination
-                    .split_once('@')
-                    .and_then(|(user, _)| (!user.is_empty()).then(|| user.to_owned()))
-            })
-            .or_else(|| self.default_user.clone())
-            .ok_or_else(|| {
-                McpError::invalid_params(
-                    "set username in the server JSON or use destination as username@host",
+        self.capture_failure("open_session", Some(&input.server), None, async {
+            self.reload_registry().await.map_err(|error| {
+                McpError::internal_error(
+                    format!("failed to reload SSH host configuration: {error}"),
                     None,
                 )
             })?;
-        let host = server
-            .destination
-            .split_once('@')
-            .map_or(server.destination.as_str(), |(_, host)| host)
-            .to_owned();
-        validate_host(&host).map_err(|e| McpError::invalid_params(e, None))?;
-        let (session_handle, mut channel) = timeout(
-            Duration::from_secs(self.connect_timeout_secs + 15),
-            connect_server(
-                &host,
-                &username,
-                server.port,
-                &server.authentication,
-                self.connect_timeout_secs,
-            ),
-        )
-        .await
-        .map_err(|_| McpError::internal_error("SSH connection timed out", None))?
-        .map_err(|error| McpError::internal_error(error, None))?;
-
-        let ready_marker = format!("__LITE_SSH_READY_{}__", Uuid::new_v4().simple());
-        channel
-            .write_all(
-                format!("export TERM=dumb; PS1=; PROMPT=; stty -echo 2>/dev/null; printf '\\n{ready_marker}\\n'\n")
-                    .as_bytes(),
+            let server = self
+                .servers
+                .read()
+                .await
+                .get(&input.server)
+                .cloned()
+                .ok_or_else(|| {
+                    McpError::invalid_params("server is not registered; call list_servers", None)
+                })?;
+            let username = server
+                .username
+                .clone()
+                .or_else(|| {
+                    server
+                        .destination
+                        .split_once('@')
+                        .and_then(|(user, _)| (!user.is_empty()).then(|| user.to_owned()))
+                })
+                .or_else(|| self.default_user.clone())
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "set username in the server JSON or use destination as username@host",
+                        None,
+                    )
+                })?;
+            let host = server
+                .destination
+                .split_once('@')
+                .map_or(server.destination.as_str(), |(_, host)| host)
+                .to_owned();
+            validate_host(&host).map_err(|e| McpError::invalid_params(e, None))?;
+            let (session_handle, mut channel) = timeout(
+                Duration::from_secs(self.connect_timeout_secs + 15),
+                connect_server(
+                    &host,
+                    &username,
+                    server.port,
+                    &server.authentication,
+                    self.connect_timeout_secs,
+                ),
             )
             .await
-            .map_err(|e| {
-                McpError::internal_error(format!("could not initialize remote shell: {e}"), None)
-            })?;
-        channel.flush().await.map_err(|e| {
-            McpError::internal_error(format!("could not initialize remote shell: {e}"), None)
-        })?;
-        let _ = read_until_token(
-            &mut channel,
-            ready_marker.as_bytes(),
-            Duration::from_secs(self.connect_timeout_secs + 5),
-        )
-        .await
-        .map_err(|error| McpError::internal_error(error, None))?;
+            .map_err(|_| McpError::internal_error("SSH connection timed out", None))?
+            .map_err(|error| McpError::internal_error(error, None))?;
 
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
-        tokio::spawn(run_session(session_handle, channel, command_rx));
-        let handle = Arc::new(SessionHandle {
-            server_name: server.name.clone(),
-            command_tx,
-            last_used: Mutex::new(tokio::time::Instant::now()),
-        });
-        let session_id = Uuid::new_v4().to_string();
-        self.sessions
-            .0
-            .lock()
+            let ready_marker = format!("__LITE_SSH_READY_{}__", Uuid::new_v4().simple());
+            channel
+                .write_all(
+                    format!("export TERM=dumb; PS1=; PROMPT=; stty -echo 2>/dev/null; printf '\\n{ready_marker}\\n'\n")
+                        .as_bytes(),
+                )
+                .await
+                .map_err(|e| {
+                    McpError::internal_error(
+                        format!("could not initialize remote shell: {e}"),
+                        None,
+                    )
+                })?;
+            channel.flush().await.map_err(|e| {
+                McpError::internal_error(
+                    format!("could not initialize remote shell: {e}"),
+                    None,
+                )
+            })?;
+            let _ = read_until_token(
+                &mut channel,
+                ready_marker.as_bytes(),
+                Duration::from_secs(self.connect_timeout_secs + 5),
+            )
             .await
-            .insert(session_id.clone(), handle);
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "session_id: {session_id}\nserver: {}\nAuthenticated persistent SSH shell is open.",
-            server.name
-        ))]))
+            .map_err(|error| McpError::internal_error(error, None))?;
+
+            let (command_tx, command_rx) = mpsc::unbounded_channel();
+            tokio::spawn(run_session(session_handle, channel, command_rx));
+            let handle = Arc::new(SessionHandle {
+                server_name: server.name.clone(),
+                command_tx,
+                last_used: Mutex::new(tokio::time::Instant::now()),
+            });
+            let session_id = Uuid::new_v4().to_string();
+            self.sessions
+                .0
+                .lock()
+                .await
+                .insert(session_id.clone(), handle);
+            Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "session_id: {session_id}\nserver: {}\nAuthenticated persistent SSH shell is open.",
+                server.name
+            ))]))
+        })
+        .await
     }
 
     #[tool(
@@ -344,42 +418,61 @@ impl SshServer {
         &self,
         Parameters(input): Parameters<CommandRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let handle = self.get_session(&input.session_id).await?;
-        let command = input.command.trim();
-        if command.is_empty() || command.contains('\n') || command.contains('\r') {
-            return Err(McpError::invalid_params(
-                "command must be non-empty and contain only one line",
-                None,
-            ));
-        }
-        let timeout_secs = input
-            .timeout_secs
-            .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS)
-            .clamp(1, MAX_COMMAND_TIMEOUT_SECS);
-        *handle.last_used.lock().await = tokio::time::Instant::now();
-        let (reply, response) = oneshot::channel();
-        handle
-            .command_tx
-            .send(SessionCommand::Run {
-                command: command.to_owned(),
-                timeout_secs,
-                isolated: input.isolated,
-                reply,
-            })
-            .map_err(|_| {
-                McpError::internal_error("SSH session has ended; open a new session", None)
-            })?;
-        let (output, exit_code) = response
-            .await
-            .map_err(|_| {
-                McpError::internal_error("SSH session closed before the command completed", None)
-            })?
-            .map_err(|error| McpError::internal_error(error, None))?;
-        *handle.last_used.lock().await = tokio::time::Instant::now();
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "exit_code: {exit_code}\n{}",
-            truncate(&output)
-        ))]))
+        let session_id = input.session_id.clone();
+        self.capture_failure("send_command", None, Some(&session_id), async {
+            let handle = self.get_session(&input.session_id).await?;
+            let command = input.command.trim();
+            if command.is_empty() || command.contains('\n') || command.contains('\r') {
+                return Err(McpError::invalid_params(
+                    "command must be non-empty and contain only one line",
+                    None,
+                ));
+            }
+            let timeout_secs = input
+                .timeout_secs
+                .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS)
+                .clamp(1, MAX_COMMAND_TIMEOUT_SECS);
+            *handle.last_used.lock().await = tokio::time::Instant::now();
+            let (reply, response) = oneshot::channel();
+            handle
+                .command_tx
+                .send(SessionCommand::Run {
+                    command: command.to_owned(),
+                    timeout_secs,
+                    isolated: input.isolated,
+                    reply,
+                })
+                .map_err(|_| {
+                    McpError::internal_error("SSH session has ended; open a new session", None)
+                })?;
+            let (output, exit_code) = response
+                .await
+                .map_err(|_| {
+                    McpError::internal_error(
+                        "SSH session closed before the command completed",
+                        None,
+                    )
+                })?
+                .map_err(|error| McpError::internal_error(error, None))?;
+            *handle.last_used.lock().await = tokio::time::Instant::now();
+            if exit_code != 0 {
+                self.record_error(
+                    "send_command",
+                    Some(&handle.server_name),
+                    Some(&input.session_id),
+                    format!(
+                        "Remote command returned exit code {exit_code}. Output:\n{}",
+                        truncate(&output)
+                    ),
+                )
+                .await;
+            }
+            Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "exit_code: {exit_code}\n{}",
+                truncate(&output)
+            ))]))
+        })
+        .await
     }
 
     #[tool(
@@ -390,17 +483,20 @@ impl SshServer {
         &self,
         Parameters(input): Parameters<SessionRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let handle = self
-            .sessions
-            .0
-            .lock()
-            .await
-            .remove(&input.session_id)
-            .ok_or_else(|| McpError::invalid_params("unknown session_id", None))?;
-        let _ = handle.command_tx.send(SessionCommand::Close);
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            "SSH session closed.".to_owned(),
-        )]))
+        self.capture_failure("close_session", None, Some(&input.session_id), async {
+            let handle = self
+                .sessions
+                .0
+                .lock()
+                .await
+                .remove(&input.session_id)
+                .ok_or_else(|| McpError::invalid_params("unknown session_id", None))?;
+            let _ = handle.command_tx.send(SessionCommand::Close);
+            Ok(CallToolResult::success(vec![ContentBlock::text(
+                "SSH session closed.".to_owned(),
+            )]))
+        })
+        .await
     }
 }
 
@@ -784,7 +880,7 @@ impl ServerHandler for SshServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
-            .with_instructions("The host registry is reloaded from host.json on every list_servers and open_session call, so edits apply without restarting this MCP process. A running SSH session keeps its established connection and credentials; close it and open a new session to apply host changes to that session. If host.json is temporarily invalid, reload returns an error and keeps the last valid registry. Call list_servers to identify a host, then open_session and reuse its session_id in send_command. For one-shot commands inside a Proxmox container, use `pct exec <CTID> -- <command>` with send_command isolated=true. Do not use interactive `pct enter` with send_command. isolated=true closes stdin and returns output and exit code without persisting shell changes. Use isolated=false when cd or exported variables must persist. Close sessions with close_session when done.")
+            .with_instructions("The host registry is reloaded from host.json on every list_servers and open_session call, so edits apply without restarting this MCP process. A running SSH session keeps its established connection and credentials; close it and open a new session to apply host changes to that session. If host.json is temporarily invalid, reload returns an error and keeps the last valid registry. If any SSH tool fails, call debug to retrieve the last failure timestamp and detailed error; debug also records nonzero remote command exits. Call list_servers to identify a host, then open_session and reuse its session_id in send_command. For one-shot commands inside a Proxmox container, use `pct exec <CTID> -- <command>` with send_command isolated=true. Do not use interactive `pct enter` with send_command. isolated=true closes stdin and returns output and exit code without persisting shell changes. Use isolated=false when cd or exported variables must persist. Close sessions with close_session when done.")
     }
 }
 
