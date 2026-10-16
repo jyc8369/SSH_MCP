@@ -904,12 +904,12 @@ mod tests {
     use super::*;
     use std::fs;
 
-    struct TestRegistry(PathBuf);
+    struct TestFile(PathBuf);
 
-    impl TestRegistry {
+    impl TestFile {
         fn new() -> Self {
             let unique = Uuid::new_v4().simple().to_string();
-            let path = env::temp_dir().join(format!("ssh-mcp-test-{unique}.json"));
+            let path = env::temp_dir().join(format!("ssh-mcp-test-{unique}"));
             Self(path)
         }
 
@@ -918,7 +918,7 @@ mod tests {
         }
     }
 
-    impl Drop for TestRegistry {
+    impl Drop for TestFile {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.0);
         }
@@ -942,7 +942,7 @@ mod tests {
 
     #[tokio::test]
     async fn reload_registry_applies_edits_and_keeps_last_valid_config_on_invalid_json() {
-        let registry = TestRegistry::new();
+        let registry = TestFile::new();
         registry.write(HOST_A);
         let server = server_for(registry.0.clone());
 
@@ -991,5 +991,61 @@ mod tests {
         let timestamp = chrono::DateTime::parse_from_rfc3339(&record.timestamp_utc)
             .expect("UTC RFC3339 timestamp");
         assert_eq!(timestamp.offset().local_minus_utc(), 0);
+    }
+
+    fn fixture_key(encoded: &str) -> russh::keys::PublicKey {
+        russh::keys::PublicKey::from_openssh(&format!("ssh-ed25519 {encoded}"))
+            .expect("parse fixture SSH public key")
+    }
+
+    async fn check_host_key(
+        path: &std::path::Path,
+        host: &str,
+        key: russh::keys::PublicKey,
+    ) -> bool {
+        let mut checker = HostKeyChecker {
+            host: host.to_owned(),
+            port: 22,
+            known_hosts_path: path.to_owned(),
+        };
+        let key = PublicKeyOrCertificate::from(key);
+        checker
+            .check_server_key(&key)
+            .await
+            .expect("host key check should return a decision")
+    }
+
+    #[tokio::test]
+    async fn rejects_a_key_for_a_host_missing_from_known_hosts() {
+        let known_hosts = TestFile::new();
+        let recorded_key =
+            fixture_key("AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ");
+        russh::keys::known_hosts::learn_known_hosts_path(
+            "other.example",
+            22,
+            &recorded_key,
+            &known_hosts.0,
+        )
+        .expect("write known host fixture");
+
+        assert!(!check_host_key(&known_hosts.0, "unknown.example", recorded_key).await);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_changed_key_for_a_known_host() {
+        let known_hosts = TestFile::new();
+        let recorded_key =
+            fixture_key("AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ");
+        let changed_key =
+            fixture_key("AAAAC3NzaC1lZDI1NTE5AAAAIA6rWI3G1sz07DnfFlrouTcysQlj2P+jpNSOEWD9OJ3X");
+        russh::keys::known_hosts::learn_known_hosts_path(
+            "server.example",
+            22,
+            &recorded_key,
+            &known_hosts.0,
+        )
+        .expect("write known host fixture");
+
+        assert!(!check_host_key(&known_hosts.0, "server.example", changed_key).await);
     }
 }
