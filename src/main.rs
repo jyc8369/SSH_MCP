@@ -898,3 +898,98 @@ async fn main() -> Result<()> {
         .context("MCP server stopped unexpectedly")?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    struct TestRegistry(PathBuf);
+
+    impl TestRegistry {
+        fn new() -> Self {
+            let unique = Uuid::new_v4().simple().to_string();
+            let path = env::temp_dir().join(format!("ssh-mcp-test-{unique}.json"));
+            Self(path)
+        }
+
+        fn write(&self, contents: &str) {
+            fs::write(&self.0, contents).expect("write test host registry");
+        }
+    }
+
+    impl Drop for TestRegistry {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn server_for(path: PathBuf) -> SshServer {
+        SshServer {
+            tool_router: SshServer::tool_router(),
+            servers: Arc::new(RwLock::new(HashMap::new())),
+            registry_path: path,
+            sessions: SessionStore(Arc::new(Mutex::new(HashMap::new()))),
+            last_error: Arc::new(Mutex::new(None)),
+            default_user: None,
+            connect_timeout_secs: 1,
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+        }
+    }
+
+    const HOST_A: &str = r#"[{"name":"alpha","destination":"alpha.example","authentication":{"type":"password","password":"secret-a"}}]"#;
+    const HOST_B: &str = r#"[{"name":"beta","destination":"beta.example","authentication":{"type":"password","password":"secret-b"}}]"#;
+
+    #[tokio::test]
+    async fn reload_registry_applies_edits_and_keeps_last_valid_config_on_invalid_json() {
+        let registry = TestRegistry::new();
+        registry.write(HOST_A);
+        let server = server_for(registry.0.clone());
+
+        server.reload_registry().await.expect("load initial config");
+        assert!(server.servers.read().await.contains_key("alpha"));
+
+        registry.write(HOST_B);
+        server.reload_registry().await.expect("apply config edit");
+        let servers = server.servers.read().await;
+        assert!(servers.contains_key("beta"));
+        assert!(!servers.contains_key("alpha"));
+        drop(servers);
+
+        registry.write("{");
+        assert!(server.reload_registry().await.is_err());
+        let servers = server.servers.read().await;
+        assert!(servers.contains_key("beta"));
+        assert!(!servers.contains_key("alpha"));
+    }
+
+    #[tokio::test]
+    async fn debug_returns_the_latest_recorded_failure_with_context() {
+        let server = server_for(PathBuf::new());
+        server
+            .record_error(
+                "open_session",
+                Some("alpha"),
+                Some("session-123"),
+                "host key rejected".to_owned(),
+            )
+            .await;
+
+        let debug = server.debug().await;
+        let rendered = serde_json::to_string(&debug).expect("serialize debug response");
+        assert!(rendered.contains("open_session"));
+        assert!(rendered.contains("alpha"));
+        assert!(rendered.contains("session-123"));
+        assert!(rendered.contains("host key rejected"));
+
+        let record = server
+            .last_error
+            .lock()
+            .await
+            .clone()
+            .expect("error record");
+        let timestamp = chrono::DateTime::parse_from_rfc3339(&record.timestamp_utc)
+            .expect("UTC RFC3339 timestamp");
+        assert_eq!(timestamp.offset().local_minus_utc(), 0);
+    }
+}
