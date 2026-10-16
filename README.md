@@ -18,7 +18,9 @@ The MCP reloads `host.json` whenever `list_servers` or `open_session` is called.
 - `close_session`: close the SSH session.
 - `debug`: return the latest failure's UTC timestamp, operation, server/session context, and detailed error. Call it after an SSH tool returns an error. Nonzero remote command exit codes are also recorded with their output.
 
-The last error is held in memory for the lifetime of the MCP process and is replaced by the next failure. Successful calls do not erase it. Command text and credentials are not added to the record; output from a failed remote command is included and may contain whatever that command printed. Sessions last for the MCP process lifetime and expire after the idle timeout. Remote commands run with the registered account's permissions; use least-privilege accounts and register only approved hosts.
+The last error is held in memory for the lifetime of the MCP process and is replaced by the next failure. Successful calls do not erase it. Command text and credentials are not added to the record; output from a failed remote command is included and may contain whatever that command printed. Sessions last for the MCP process lifetime and expire after the idle timeout.
+
+**Security:** Anyone who can call this MCP's tools can run arbitrary remote commands with the permissions of a registered SSH account, including through a persistent interactive shell. There is no command allowlist or per-command confirmation. Do not register a root account; use a dedicated, restricted account with only the permissions the MCP needs, and register only approved hosts. This server uses MCP over stdio, so publishing this folder to a public GitHub repository does not by itself expose the server or open remote access. Access depends on who can invoke the configured MCP process and on the SSH credentials in the local, Git-ignored `host.json`.
 
 ## Build
 
