@@ -170,9 +170,14 @@ impl SshServer {
             .or_else(|| env::var_os("SSH_SERVERS_FILE"))
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join("host.json")
+                env::current_exe()
+                    .ok()
+                    .and_then(|path| path.parent().map(|dir| dir.join("host.json")))
+                    .unwrap_or_else(|| {
+                        env::current_dir()
+                            .unwrap_or_else(|_| PathBuf::from("."))
+                            .join("host.json")
+                    })
             });
         let servers = load_registry(&registry_path)?;
 

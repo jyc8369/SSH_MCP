@@ -12,7 +12,7 @@ Rust-based MCP server that opens persistent SSH shell sessions over stdio. It su
 
 ## Configuration
 
-Copy [`host.example.json`](host.example.json) to `host.json` beside the MCP executable, then replace the placeholder values. The registry accepts a single host object, an array of hosts, or an object containing a `hosts` array.
+Copy [`host.example.json`](host.example.json) to `host.json` in the same directory as `ssh-mcp.exe`, then replace the placeholder values. By default, the server reads settings from this adjacent `host.json`; the MCP client's working directory does not affect that lookup. The registry accepts a single host object, an array of hosts, or an object containing a `hosts` array.
 
 Each host has the following fields:
 
@@ -37,7 +37,7 @@ Authentication supports these forms:
 
 Use an absolute key path to avoid ambiguity about the process working directory. Before connecting, verify the SSH server fingerprint and add its key to the current user's `~/.ssh/known_hosts` file (`%USERPROFILE%\.ssh\known_hosts` on Windows). Unknown and changed keys are rejected; this server does not offer a prompt to trust a new key.
 
-The MCP client must launch the server with its working directory set to the directory containing `host.json`, unless `SSH_HOST_FILE` is set to another path. `host.json` is Git-ignored because it contains credentials; restrict its filesystem permissions and never commit it.
+Set `SSH_HOST_FILE` to override the adjacent `host.json` path. The older `SSH_SERVERS_FILE` variable is also supported; relative override paths are resolved from the MCP process's working directory. `host.json` is Git-ignored because it contains credentials; restrict its filesystem permissions and never commit it.
 
 The registry is reloaded on every `list_servers` and `open_session` call. A valid edit applies to the next call without restarting the process. If the file is temporarily invalid, the call reports a reload error and the last valid registry stays active. Existing sessions keep their original connection and credentials; close and reopen them to apply host changes.
 
@@ -70,7 +70,13 @@ cargo build --release --locked
 cargo test --locked
 ```
 
-The release executable is `target\release\ssh-mcp.exe` on Windows. Configure the MCP client to launch that executable and set its working directory to the directory containing `host.json`.
+The release executable is `target\release\ssh-mcp.exe` on Windows. After building from the repository root, copy the example registry beside it:
+
+```powershell
+Copy-Item .\host.example.json .\target\release\host.json
+```
+
+Replace the example credentials before use. Configure the MCP client to launch `ssh-mcp.exe`; its working directory can be set independently because the default registry path is resolved beside the executable.
 
 ## Environment variables
 
