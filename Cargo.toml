@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.89"
 description = "Registry-driven SSH sessions over MCP stdio"
 license = "MIT"
+repository = "https://github.com/jyc8369/SSH_MCP"
 
 [dependencies]
 anyhow = "1"
