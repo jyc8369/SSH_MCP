@@ -1,34 +1,83 @@
 # SSH MCP
 
-Rust MCP stdio server for user-configured SSH hosts. It supports password and private-key authentication, checks host keys against the local `~/.ssh/known_hosts`, and keeps interactive shells alive between MCP calls.
+Rust-based MCP server that opens persistent SSH shell sessions over stdio. It supports password and private-key authentication, and checks server keys against the current user's `known_hosts` file.
 
-## Host configuration
+## Features
 
-Copy `host.example.json` to `host.json` in this MCP directory and replace the example values. Configure the MCP client's `cwd` as this same directory so the server loads `host.json`. You can override the path with `SSH_HOST_FILE`; the older `SSH_SERVERS_FILE` environment variable remains supported. `host.json` is excluded from Git because it contains credentials. Restrict its Windows file permissions.
+- Load one or more SSH hosts from a local JSON registry.
+- Reload registry changes on `list_servers` and `open_session` calls without restarting the MCP process.
+- Run commands in persistent sessions or as isolated one-shot commands.
+- Record the most recent tool failure for inspection with `debug`.
+- Reject unknown or changed SSH server keys.
 
-The JSON can be a single host object, an array of hosts, or an object with a `hosts` array. Each host has a unique `name`, `destination`, optional `port` (default `22`), `username`, `authentication`, and optional `description`. Authentication supports `password` or `private_key` with a key path and optional passphrase. Unknown or changed server keys are rejected; verify and add the key to the current user's `~/.ssh/known_hosts` first.
+## Configuration
 
-The MCP reloads `host.json` whenever `list_servers` or `open_session` is called. Changes therefore apply to the next tool call without restarting the MCP process. Existing SSH sessions remain connected with their original settings; close and reopen a session to apply host changes. If the file is temporarily invalid JSON, the tool returns a reload error and retains the last valid configuration.
+Copy [`host.example.json`](host.example.json) to `host.json` beside the MCP executable, then replace the placeholder values. The registry accepts a single host object, an array of hosts, or an object containing a `hosts` array.
+
+Each host has the following fields:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `name` | Yes | Unique name used to select the host in MCP calls. |
+| `destination` | Yes | Hostname or IP address. It may be prefixed with `username@`. |
+| `port` | No | SSH port; defaults to `22`. |
+| `username` | No | SSH account name. Can be supplied in `destination` or through `SSH_USER`. |
+| `authentication` | Yes | An authentication object described below. |
+| `description` | No | Human-readable label shown by `list_servers`. |
+
+Authentication supports these forms:
+
+```json
+{"type":"password","password":"replace-me"}
+```
+
+```json
+{"type":"private_key","private_key_path":"C:\\Users\\you\\.ssh\\id_ed25519","passphrase":""}
+```
+
+Use an absolute key path to avoid ambiguity about the process working directory. Before connecting, verify the SSH server fingerprint and add its key to the current user's `~/.ssh/known_hosts` file (`%USERPROFILE%\.ssh\known_hosts` on Windows). Unknown and changed keys are rejected; this server does not offer a prompt to trust a new key.
+
+The MCP client must launch the server with its working directory set to the directory containing `host.json`, unless `SSH_HOST_FILE` is set to another path. `host.json` is Git-ignored because it contains credentials; restrict its filesystem permissions and never commit it.
+
+The registry is reloaded on every `list_servers` and `open_session` call. A valid edit applies to the next call without restarting the process. If the file is temporarily invalid, the call reports a reload error and the last valid registry stays active. Existing sessions keep their original connection and credentials; close and reopen them to apply host changes.
 
 ## MCP tools
 
-- `list_servers`: list host names and authentication types without revealing credentials.
-- `open_session`: authenticate and return a reusable `session_id`.
-- `send_command`: execute a command in that persistent shell. `cd` and exported variables persist. Set `isolated: true` to run a one-shot command and return its exit code without persisting shell changes.
-- `close_session`: close the SSH session.
-- `debug`: return the latest failure's UTC timestamp, operation, server/session context, and detailed error. Call it after an SSH tool returns an error. Nonzero remote command exit codes are also recorded with their output.
+| Tool | Purpose |
+| --- | --- |
+| `list_servers` | Reload the registry and list host names, authentication types, and active session counts. Credentials are not returned. |
+| `open_session` | Reload the registry, authenticate to a selected host, and return a reusable `session_id`. |
+| `send_command` | Run a single-line command in a session and return its output and exit code. |
+| `close_session` | Close a persistent SSH session. |
+| `debug` | Return the latest failure's UTC time, operation, host/session context, and details. |
 
-The last error is held in memory for the lifetime of the MCP process and is replaced by the next failure. Successful calls do not erase it. Command text and credentials are not added to the record; output from a failed remote command is included and may contain whatever that command printed. Sessions last for the MCP process lifetime and expire after the idle timeout.
+`send_command` uses the persistent shell by default, so directory changes and exported variables remain in effect for later commands. Set `isolated: true` to run a one-shot command without preserving shell changes. Isolated mode requires common POSIX shell utilities on the remote host, including `mktemp`, `cat`, and `rm`. The optional `timeout_secs` argument defaults to 30 seconds and is limited to 1–300 seconds. Sessions expire after the configured idle timeout and close when the MCP process exits.
 
-**Security:** Anyone who can call this MCP's tools can run arbitrary remote commands with the permissions of a registered SSH account, including through a persistent interactive shell. There is no command allowlist or per-command confirmation. Do not register a root account; use a dedicated, restricted account with only the permissions the MCP needs, and register only approved hosts. This server uses MCP over stdio, so publishing this folder to a public GitHub repository does not by itself expose the server or open remote access. Access depends on who can invoke the configured MCP process and on the SSH credentials in the local, Git-ignored `host.json`.
+The most recent failure is held in memory until another failure or process exit. Successful calls do not clear it. Nonzero remote command exit codes are recorded with their output. Command text and credentials are not recorded, but output from a failed remote command may be included and can contain sensitive data. Output is truncated at 64 KiB.
 
-## Build
+## Security
 
-Requires Rust 1.89+ and Cargo. From this directory:
+Anyone who can call this MCP's tools can run arbitrary remote commands with the permissions of a registered SSH account. There is no command allowlist or per-command confirmation. Do not register a root account; use a dedicated, restricted account with only the permissions the MCP needs, and register only approved hosts.
+
+This server uses MCP over stdio and does not listen for network connections. Publishing this repository on GitHub does not by itself expose the running MCP process. Access depends on who can invoke the configured local process and on the credentials in the local, Git-ignored `host.json`.
+
+## Build and test
+
+Requires Rust 1.89 or later and Cargo. From the repository directory:
 
 ```powershell
 cargo build --release --locked
-.\target\release\ssh-mcp.exe
+cargo test --locked
 ```
 
-Set the MCP client's `command` to the executable's absolute path and `cwd` to this directory. Optional environment settings: `SSH_HOST_FILE`, `SSH_CONNECT_TIMEOUT_SECS` (1–60), `SSH_IDLE_TIMEOUT_SECS` (30–86400; default 1800), and `SSH_USER`.
+The release executable is `target\release\ssh-mcp.exe` on Windows. Configure the MCP client to launch that executable and set its working directory to the directory containing `host.json`.
+
+## Environment variables
+
+| Variable | Description |
+| --- | --- |
+| `SSH_HOST_FILE` | Path to the host registry. Takes precedence over `SSH_SERVERS_FILE`. |
+| `SSH_SERVERS_FILE` | Legacy alias for the registry path. |
+| `SSH_USER` | Fallback username when the host entry and destination omit one. |
+| `SSH_CONNECT_TIMEOUT_SECS` | SSH connection timeout in seconds; accepted range is 1–60, default is 10. |
+| `SSH_IDLE_TIMEOUT_SECS` | Idle session timeout in seconds; accepted range is 30–86400, default is 1800. |
